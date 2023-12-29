@@ -1730,12 +1730,23 @@ fn deserialize_untagged_enum_after(
         .iter()
         .filter(|variant| !variant.attrs.skip_deserializing())
         .map(|variant| {
-            Expr(deserialize_untagged_variant(
+            let de_any = Expr(deserialize_untagged_variant(
                 params,
                 variant,
                 cattrs,
                 quote!(__deserializer),
-            ))
+            ));
+            let variant_name = variant.ident.to_string();
+            quote! {
+                _serde::__private::Result::map_err(
+                    #de_any,
+                    |e| -> __D::Error {
+                        _serde::de::Error::custom(
+                            format!("attempted to deserialize `{}` but failed with: {}", #variant_name, e.to_string())
+                        )
+                    },
+                )
+            }
         });
     // TODO this message could be better by saving the errors from the failed
     // attempts. The heuristic used by TOML was to count the number of fields
@@ -1744,10 +1755,11 @@ fn deserialize_untagged_enum_after(
     // better to save all the errors and combine them into one message that
     // explains why none of the variants matched.
     let fallthrough_msg = format!(
-        "data did not match any variant of untagged enum {}",
+        "data did not match any variant of untagged enum `{}`",
         params.type_name()
     );
     let fallthrough_msg = cattrs.expecting().unwrap_or(&fallthrough_msg);
+    let has_custom_err_msg = cattrs.expecting().is_some();
 
     // Ignore any error associated with non-untagged deserialization so that we
     // can fall through to the untagged variants. This may be infallible so we
@@ -1763,16 +1775,24 @@ fn deserialize_untagged_enum_after(
     quote_block! {
         let __content = <_serde::__private::de::Content as _serde::Deserialize>::deserialize(__deserializer)?;
         let __deserializer = _serde::__private::de::ContentRefDeserializer::<__D::Error>::new(&__content);
+        let mut fallthrough_msg = #fallthrough_msg.to_string();
 
         #first_attempt
 
         #(
-            if let _serde::__private::Ok(__ok) = #attempts {
-                return _serde::__private::Ok(__ok);
+            match #attempts {
+                _serde::__private::Ok(__ok) => return _serde::__private::Ok(__ok),
+                _serde::__private::Err(__err) => {
+                    if !#has_custom_err_msg {
+                        fallthrough_msg.push_str("\n\t- ");
+                        fallthrough_msg.push_str(&__err.to_string());
+                    }
+                }
             }
         )*
 
-        _serde::__private::Err(_serde::de::Error::custom(#fallthrough_msg))
+
+        _serde::__private::Err(_serde::de::Error::custom(fallthrough_msg))
     }
 }
 
